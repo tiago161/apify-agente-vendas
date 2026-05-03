@@ -26,6 +26,7 @@
     },
     "maxResultsPerQuery": {
       "title": "Máximo de resultados por busca",
+      "description": "Número máximo de empresas ou perfis coletados por combinação de termo + local",
       "type": "integer",
       "minimum": 1,
       "maximum": 100,

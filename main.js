@@ -46,38 +46,60 @@ async function scrapeGoogleMaps(browser) {
 
       try {
         const url = `https://www.google.com/maps/search/${encodeURIComponent(`${query} ${location}`)}`
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 40_000 })
+
+        // networkidle nunca termina no Maps — usar load + waitForSelector
+        await page.goto(url, { waitUntil: 'load', timeout: 40_000 })
+
+        // Aguarda o feed de resultados aparecer
+        await page.waitForSelector('[role="feed"]', { timeout: 20_000 }).catch(() => null)
         await page.waitForTimeout(2000)
 
         // Rola o feed para carregar mais resultados
-        const feed = await page.$('[role="feed"]')
-        if (feed) {
-          const scrolls = Math.ceil(maxResultsPerQuery / 5)
-          for (let i = 0; i < scrolls; i++) {
-            await feed.evaluate(el => el.scrollBy(0, 1200))
-            await page.waitForTimeout(1200)
-          }
+        const scrolls = Math.ceil(maxResultsPerQuery / 5)
+        for (let i = 0; i < scrolls; i++) {
+          await page.evaluate(() => {
+            const feed = document.querySelector('[role="feed"]')
+            if (feed) feed.scrollBy(0, 1200)
+          })
+          await page.waitForTimeout(1000)
         }
 
-        const cards = (await page.$$('[data-result-index]')).slice(0, maxResultsPerQuery)
+        // Seletores atuais do Google Maps (2024+)
+        const cardSelectors = ['.Nv2PK', '[role="article"]', '.hfpxzc']
+        let cards = []
+        for (const sel of cardSelectors) {
+          cards = await page.$$(sel)
+          if (cards.length > 0) break
+        }
+        cards = cards.slice(0, maxResultsPerQuery)
         console.log(`   Encontrados ${cards.length} resultados`)
 
         for (const card of cards) {
           try {
             await card.click()
-            await page.waitForTimeout(1500)
 
-            const name     = await safeText(page, 'h1')
-            const phone    = await safeText(page, 'button[data-item-id^="phone"]')
-              ?? await safeText(page, '[data-tooltip="Copiar número de telefone"]')
+            // Aguarda painel lateral carregar
+            await page.waitForSelector('h1', { timeout: 8_000 }).catch(() => null)
+            await page.waitForTimeout(1000)
+
+            const name = await safeText(page, 'h1')
+
+            // Telefone: atributo data-item-id="phone:+55..."
+            const phone = await page.$eval(
+              '[data-item-id^="phone:"]',
+              el => el.getAttribute('data-item-id')?.replace('phone:', '') ?? null
+            ).catch(() => safeText(page, 'button[data-tooltip*="telefone"]'))
+
             const website  = await safeAttr(page, 'a[data-item-id="authority"]', 'href')
-            const category = await safeText(page, 'button[jsaction*="category"]')
+            const category = await safeText(page, '[jsaction*="category"] span')
+              ?? await safeText(page, 'button[jsaction*="category"]')
             const address  = await safeText(page, '[data-item-id="address"]')
+              ?? await safeText(page, '[aria-label*="Endereço"]')
 
             if (name) {
               allLeads.push({
                 companyName:    name,
-                companyPhone:   phone  ?? null,
+                companyPhone:   typeof phone === 'string' ? phone.trim() : null,
                 website:        website ?? null,
                 category:       category ?? null,
                 address:        address ?? null,
@@ -85,6 +107,7 @@ async function scrapeGoogleMaps(browser) {
                 source:         'google_maps',
                 decisionMakers: [],
               })
+              console.log(`   ✓ ${name}`)
             }
           } catch (err) {
             console.warn('   Aviso ao processar card:', err.message)

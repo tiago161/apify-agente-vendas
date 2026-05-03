@@ -6,19 +6,30 @@ await Actor.init()
 
 const input = await Actor.getInput()
 const {
-  searchQueries    = ['escola particular'],
-  locations        = ['São Paulo, SP'],
-  sources          = ['google_maps'],
+  searchQueries      = ['escola particular'],
+  locations          = ['São Paulo, SP'],
+  sources            = ['google_maps'],
   maxResultsPerQuery = 20,
-  webhookUrl       = '',
-  webhookSecret    = '',
-  linkedinCookie   = '',
+  webhookUrl         = '',
+  webhookSecret      = '',
+  linkedinCookie     = '',
+  excludeKeywords    = [],   // ex: ['supermercado', 'mercado', 'varejão', 'atacado']
 } = input ?? {}
 
 const allLeads = []
 const seenCompanies = new Set()
 
+function isExcluded(text) {
+  if (!text || excludeKeywords.length === 0) return false
+  const lower = text.toLowerCase()
+  return excludeKeywords.some(kw => lower.includes(kw.toLowerCase()))
+}
+
 function addLead(lead) {
+  if (isExcluded(lead.companyName) || isExcluded(lead.category)) {
+    console.log(`   ⏭ Ignorado (filtro): ${lead.companyName}`)
+    return
+  }
   const key = lead.companyName.trim().toLowerCase()
   if (seenCompanies.has(key)) return
   seenCompanies.add(key)
@@ -45,6 +56,99 @@ async function safeAttr(page, selector, attr) {
   return page.$eval(selector, (el, a) => el.getAttribute(a), attr).catch(() => null)
 }
 
+function extractEmails(html) {
+  return [...new Set((html.match(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi) ?? [])
+    .filter(e => !/noreply|example|seudominio|@2x|\.png|\.jpg/i.test(e)))]
+}
+
+function extractCnpj(html) {
+  const m = html.match(/\d{2}[.\-]?\d{3}[.\-]?\d{3}[\/\-]?\d{4}[.\-]?\d{2}/)
+  if (!m) return null
+  const digits = m[0].replace(/\D/g, '')
+  return digits.length === 14 ? digits : null
+}
+
+// ── Enriquece via site da empresa ─────────────────────────
+async function enrichFromWebsite(browser, lead) {
+  if (!lead.website) return null
+  const page = await browser.newPage()
+  try {
+    await page.goto(lead.website, { waitUntil: 'load', timeout: 15_000 })
+    const html = await page.content()
+
+    // Emails e CNPJ na home
+    const homeEmails = extractEmails(html)
+    const cnpj = extractCnpj(html)
+
+    // Tenta páginas de contato/sobre/equipe
+    const contactUrls = await page.$$eval('a[href]', (els, base) =>
+      els.map(el => el.href)
+        .filter(h => h.startsWith(base) && /contato|fale|contact|sobre|equipe|time|about/i.test(h))
+        .slice(0, 3),
+      new URL(lead.website).origin
+    ).catch(() => [])
+
+    const extraEmails = []
+    for (const url of contactUrls) {
+      const sub = await browser.newPage()
+      try {
+        await sub.goto(url, { waitUntil: 'load', timeout: 10_000 })
+        extraEmails.push(...extractEmails(await sub.content()))
+      } catch { /* ignora */ } finally { await sub.close() }
+    }
+
+    const allEmails = [...new Set([...homeEmails, ...extraEmails])]
+
+    // Se não tem decisor ainda, cria um com o e-mail encontrado
+    if (allEmails.length > 0 && lead.decisionMakers.length === 0) {
+      lead.decisionMakers.push({
+        name:          'Contato ' + lead.companyName,
+        email:         allEmails[0],
+        role:          'Contato do Site',
+        phonePersonal: null,
+      })
+    } else if (allEmails.length > 0) {
+      // Completa e-mail de decisor existente se estiver vazio
+      lead.decisionMakers.forEach(dm => { if (!dm.email) dm.email = allEmails[0] })
+    }
+
+    if (cnpj) lead.cnpj = cnpj
+    console.log(`   🌐 Site: ${allEmails.length} email(s), CNPJ: ${cnpj ?? 'não encontrado'}`)
+    return cnpj
+  } catch (err) {
+    console.warn(`   🌐 Erro no site ${lead.website}: ${err.message}`)
+    return null
+  } finally {
+    await page.close()
+  }
+}
+
+// ── Enriquece via CNPJ (BrasilAPI — sem auth) ─────────────
+async function enrichFromCnpj(lead, cnpj) {
+  if (!cnpj) return
+  try {
+    const { data } = await axios.get(`https://brasilapi.com.br/api/cnpj/v1/${cnpj}`, { timeout: 12_000 })
+    const socios = data.qsa ?? []
+    for (const socio of socios.slice(0, 3)) {
+      if (!socio.nome_socio) continue
+      const already = lead.decisionMakers.find(dm =>
+        dm.name.toLowerCase().includes(socio.nome_socio.toLowerCase())
+      )
+      if (!already) {
+        lead.decisionMakers.push({
+          name:          socio.nome_socio,
+          role:          socio.qualificacao_socio ?? 'Sócio/Administrador',
+          email:         null,
+          phonePersonal: null,
+        })
+      }
+    }
+    if (socios.length > 0) console.log(`   🏛️ CNPJ: ${socios.length} sócio(s) encontrado(s)`)
+  } catch (err) {
+    if (err?.response?.status !== 404) console.warn(`   🏛️ CNPJ ${cnpj}: ${err.message}`)
+  }
+}
+
 // ── Google Maps ──────────────────────────────────────────
 async function scrapeGoogleMaps(browser) {
   for (const query of searchQueries) {
@@ -54,15 +158,10 @@ async function scrapeGoogleMaps(browser) {
 
       try {
         const url = `https://www.google.com/maps/search/${encodeURIComponent(`${query} ${location}`)}`
-
-        // networkidle nunca termina no Maps — usar load + waitForSelector
         await page.goto(url, { waitUntil: 'load', timeout: 40_000 })
-
-        // Aguarda o feed de resultados aparecer
         await page.waitForSelector('[role="feed"]', { timeout: 20_000 }).catch(() => null)
         await page.waitForTimeout(2000)
 
-        // Rola o feed para carregar mais resultados
         const scrolls = Math.ceil(maxResultsPerQuery / 5)
         for (let i = 0; i < scrolls; i++) {
           await page.evaluate(() => {
@@ -72,7 +171,6 @@ async function scrapeGoogleMaps(browser) {
           await page.waitForTimeout(1000)
         }
 
-        // Seletores atuais do Google Maps (2024+)
         const cardSelectors = ['.Nv2PK', '[role="article"]', '.hfpxzc']
         let cards = []
         for (const sel of cardSelectors) {
@@ -84,7 +182,6 @@ async function scrapeGoogleMaps(browser) {
 
         for (const card of cards) {
           try {
-            // Extrai o nome diretamente do card na lista (evita pegar o h1 "Results" da página)
             const name = await card.$eval('.qBF1Pd', el => el.textContent?.trim()).catch(() => null)
               ?? await card.$eval('.fontHeadlineSmall', el => el.textContent?.trim()).catch(() => null)
               ?? await card.$eval('a[aria-label]', el => el.getAttribute('aria-label')).catch(() => null)
@@ -94,7 +191,6 @@ async function scrapeGoogleMaps(browser) {
             await card.click()
             await page.waitForTimeout(1500)
 
-            // Telefone: data-item-id="phone:+55..."
             const phone = await page.$eval(
               '[data-item-id^="phone:"]',
               el => el.getAttribute('data-item-id')?.replace('phone:', '') ?? null
@@ -139,15 +235,9 @@ async function scrapeLinkedIn(browser) {
     for (const location of locations) {
       console.log(`\n💼 LinkedIn: "${query}" em "${location}"`)
       const context = await browser.newContext()
-
-      await context.addCookies([{
-        name:   'li_at',
-        value:  linkedinCookie,
-        domain: '.linkedin.com',
-        path:   '/',
-      }])
-
+      await context.addCookies([{ name: 'li_at', value: linkedinCookie, domain: '.linkedin.com', path: '/' }])
       const page = await context.newPage()
+
       try {
         const url = `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(query)}&location=${encodeURIComponent(location)}`
         await page.goto(url, { waitUntil: 'networkidle', timeout: 40_000 })
@@ -158,9 +248,9 @@ async function scrapeLinkedIn(browser) {
 
         for (const card of cards) {
           try {
-            const name       = await card.$eval('.entity-result__title-text a span[aria-hidden="true"]', el => el.textContent?.trim()).catch(() => '')
-            const role       = await card.$eval('.entity-result__primary-subtitle',   el => el.textContent?.trim()).catch(() => null)
-            const company    = await card.$eval('.entity-result__secondary-subtitle', el => el.textContent?.trim()).catch(() => null)
+            const name        = await card.$eval('.entity-result__title-text a span[aria-hidden="true"]', el => el.textContent?.trim()).catch(() => '')
+            const role        = await card.$eval('.entity-result__primary-subtitle',   el => el.textContent?.trim()).catch(() => null)
+            const company     = await card.$eval('.entity-result__secondary-subtitle', el => el.textContent?.trim()).catch(() => null)
             const linkedinUrl = await card.$eval('.entity-result__title-text a',       el => el.getAttribute('href')).catch(() => null)
 
             if (name) {
@@ -202,43 +292,31 @@ async function scrapeInstagram(browser) {
       )
 
       const visitedProfiles = new Set()
-
       for (const postHref of postLinks) {
         if (visitedProfiles.size >= maxResultsPerQuery) break
-
         try {
           await page.goto(`https://www.instagram.com${postHref}`, { waitUntil: 'networkidle', timeout: 25_000 })
           await page.waitForTimeout(800)
-
           const profileHref = await page.$eval('a[href^="/"][role="link"]', el => el.getAttribute('href')).catch(() => null)
           if (!profileHref || visitedProfiles.has(profileHref)) continue
           visitedProfiles.add(profileHref)
-
           await page.goto(`https://www.instagram.com${profileHref}`, { waitUntil: 'networkidle', timeout: 25_000 })
           await page.waitForTimeout(800)
-
           const name = await safeText(page, 'h1') ?? await safeText(page, 'h2')
           const bio  = await safeText(page, '.-vDIg span') ?? await safeText(page, '._aa_c')
-
           const phoneMatch = bio?.match(/(\+?[\d\s\-().]{9,})/)
           const emailMatch = bio?.match(/[\w.-]+@[\w.-]+\.\w+/)
-
           if (name) {
             addLead({
               companyName:    name,
               companyPhone:   phoneMatch?.[1]?.trim() ?? null,
               source:         'instagram',
               location:       locations[0] ?? '',
-              decisionMakers: emailMatch ? [{
-                name,
-                email:         emailMatch[0],
-                role:          null,
-                phonePersonal: phoneMatch?.[1]?.trim() ?? null,
-              }] : [],
+              decisionMakers: emailMatch ? [{ name, email: emailMatch[0], role: null, phonePersonal: phoneMatch?.[1]?.trim() ?? null }] : [],
             })
           }
         } catch (err) {
-          console.warn('   Aviso ao processar post/perfil Instagram:', err.message)
+          console.warn('   Aviso Instagram:', err.message)
         }
       }
     } catch (err) {
@@ -254,6 +332,7 @@ console.log(`\n🚀 Iniciando coleta de leads`)
 console.log(`   Termos: ${searchQueries.join(', ')}`)
 console.log(`   Locais: ${locations.join(', ')}`)
 console.log(`   Fontes: ${sources.join(', ')}`)
+console.log(`   Filtros: ${excludeKeywords.length ? excludeKeywords.join(', ') : 'nenhum'}`)
 console.log(`   Máx/busca: ${maxResultsPerQuery}\n`)
 
 const browser = await chromium.launch({ headless: true })
@@ -262,13 +341,21 @@ try {
   if (sources.includes('google_maps')) await scrapeGoogleMaps(browser)
   if (sources.includes('linkedin'))    await scrapeLinkedIn(browser)
   if (sources.includes('instagram'))   await scrapeInstagram(browser)
+
+  // Enriquecimento: site + CNPJ
+  const leadsWithSite = allLeads.filter(l => l.website)
+  if (leadsWithSite.length > 0) {
+    console.log(`\n🔍 Enriquecendo ${leadsWithSite.length} lead(s) com dados do site e CNPJ...`)
+    for (const lead of leadsWithSite) {
+      const cnpj = await enrichFromWebsite(browser, lead)
+      await enrichFromCnpj(lead, cnpj ?? lead.cnpj ?? null)
+    }
+  }
 } finally {
   await browser.close()
 }
 
 console.log(`\n📊 Total de leads coletados: ${allLeads.length}`)
-
 await sendToCrm(allLeads)
 await Actor.pushData(allLeads)
-
 await Actor.exit()

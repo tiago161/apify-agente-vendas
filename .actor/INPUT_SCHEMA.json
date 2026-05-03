@@ -51,6 +51,13 @@
       "type": "string",
       "editor": "textfield",
       "isSecret": true
+    },
+    "excludeKeywords": {
+      "title": "Palavras para excluir",
+      "description": "Empresas cujo nome ou categoria contenha essas palavras serão ignoradas. Ex: supermercado, mercado, atacado, varejão",
+      "type": "array",
+      "editor": "stringList",
+      "default": []
     }
   },
   "required": ["searchQueries", "locations", "webhookUrl", "webhookSecret"]

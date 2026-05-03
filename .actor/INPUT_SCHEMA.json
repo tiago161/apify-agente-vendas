@@ -1,0 +1,56 @@
+{
+  "title": "Agente de Vendas — CRM Orbitask",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "searchQueries": {
+      "title": "O que buscar",
+      "description": "Termos de pesquisa (ex: escola particular, clínica odontológica)",
+      "type": "array",
+      "editor": "stringList",
+      "default": ["escola particular"]
+    },
+    "locations": {
+      "title": "Onde buscar",
+      "description": "Cidades ou regiões (ex: São Paulo, SP)",
+      "type": "array",
+      "editor": "stringList",
+      "default": ["São Paulo, SP"]
+    },
+    "sources": {
+      "title": "Fontes de dados",
+      "description": "Quais plataformas usar: google_maps, linkedin, instagram",
+      "type": "array",
+      "editor": "stringList",
+      "default": ["google_maps"]
+    },
+    "maxResultsPerQuery": {
+      "title": "Máximo de resultados por busca",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "default": 20
+    },
+    "webhookUrl": {
+      "title": "URL do Webhook CRM",
+      "description": "Ex: https://seu-app.awsapprunner.com/crm/webhook/apify",
+      "type": "string",
+      "editor": "textfield"
+    },
+    "webhookSecret": {
+      "title": "Secret do Webhook",
+      "description": "Mesmo valor de CRM_WEBHOOK_SECRET configurado no backend",
+      "type": "string",
+      "editor": "textfield",
+      "isSecret": true
+    },
+    "linkedinCookie": {
+      "title": "Cookie LinkedIn (li_at)",
+      "description": "Extraia do navegador após login no LinkedIn. Necessário apenas para fonte 'linkedin'.",
+      "type": "string",
+      "editor": "textfield",
+      "isSecret": true
+    }
+  },
+  "required": ["searchQueries", "locations", "webhookUrl", "webhookSecret"]
+}

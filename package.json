@@ -1,0 +1,18 @@
+{
+  "name": "agente-de-vendas-crm",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Apify actor para prospecção de leads — CRM Orbitask",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "dependencies": {
+    "apify": "^3.2.2",
+    "playwright": "^1.45.0",
+    "axios": "^1.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

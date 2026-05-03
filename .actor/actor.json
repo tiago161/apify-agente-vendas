@@ -1,0 +1,9 @@
+{
+  "actorSpecification": 1,
+  "name": "agente-de-vendas-crm",
+  "title": "Agente de Vendas — CRM Orbitask",
+  "description": "Coleta leads do Google Maps, LinkedIn e Instagram e envia automaticamente para o CRM Orbitask",
+  "version": "0.1",
+  "buildTag": "latest",
+  "input": "./INPUT_SCHEMA.json"
+}

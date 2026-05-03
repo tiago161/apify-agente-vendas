@@ -76,39 +76,37 @@ async function scrapeGoogleMaps(browser) {
 
         for (const card of cards) {
           try {
+            // Extrai o nome diretamente do card na lista (evita pegar o h1 "Results" da página)
+            const name = await card.$eval('.qBF1Pd', el => el.textContent?.trim()).catch(() => null)
+              ?? await card.$eval('.fontHeadlineSmall', el => el.textContent?.trim()).catch(() => null)
+              ?? await card.$eval('a[aria-label]', el => el.getAttribute('aria-label')).catch(() => null)
+
+            if (!name || name === 'Results') continue
+
             await card.click()
+            await page.waitForTimeout(1500)
 
-            // Aguarda painel lateral carregar
-            await page.waitForSelector('h1', { timeout: 8_000 }).catch(() => null)
-            await page.waitForTimeout(1000)
-
-            const name = await safeText(page, 'h1')
-
-            // Telefone: atributo data-item-id="phone:+55..."
+            // Telefone: data-item-id="phone:+55..."
             const phone = await page.$eval(
               '[data-item-id^="phone:"]',
               el => el.getAttribute('data-item-id')?.replace('phone:', '') ?? null
-            ).catch(() => safeText(page, 'button[data-tooltip*="telefone"]'))
+            ).catch(() => null)
 
             const website  = await safeAttr(page, 'a[data-item-id="authority"]', 'href')
-            const category = await safeText(page, '[jsaction*="category"] span')
-              ?? await safeText(page, 'button[jsaction*="category"]')
+            const category = await safeText(page, 'button[jsaction*="category"]')
             const address  = await safeText(page, '[data-item-id="address"]')
-              ?? await safeText(page, '[aria-label*="Endereço"]')
 
-            if (name) {
-              allLeads.push({
-                companyName:    name,
-                companyPhone:   typeof phone === 'string' ? phone.trim() : null,
-                website:        website ?? null,
-                category:       category ?? null,
-                address:        address ?? null,
-                location,
-                source:         'google_maps',
-                decisionMakers: [],
-              })
-              console.log(`   ✓ ${name}`)
-            }
+            allLeads.push({
+              companyName:    name,
+              companyPhone:   phone?.trim() ?? null,
+              website:        website ?? null,
+              category:       category ?? null,
+              address:        address ?? null,
+              location,
+              source:         'google_maps',
+              decisionMakers: [],
+            })
+            console.log(`   ✓ ${name}`)
           } catch (err) {
             console.warn('   Aviso ao processar card:', err.message)
           }

@@ -230,6 +230,66 @@ async function enrichFromCnpj(lead, cnpj) {
   }
 }
 
+// ── Busca decisor no LinkedIn via Google (sem cookie) ────
+// Usa Google para indexar perfis públicos do LinkedIn
+async function findLinkedInDecisionMaker(browser, lead) {
+  const page = await browser.newPage()
+  try {
+    const terms   = 'CEO OR diretor OR diretor-executivo OR proprietário OR fundador OR presidente OR sócio'
+    const query   = encodeURIComponent(`site:linkedin.com/in "${lead.companyName}" (${terms})`)
+    const url     = `https://www.google.com/search?q=${query}&hl=pt-BR&num=5`
+
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15_000 })
+    await page.waitForTimeout(1000)
+
+    // Extrai resultados: título + snippet + URL
+    const results = await page.$$eval('div.g, div[data-sokoban-container]', els =>
+      els.slice(0, 5).map(el => ({
+        title: el.querySelector('h3')?.textContent?.trim() ?? '',
+        url:   el.querySelector('a')?.href ?? '',
+        snippet: el.querySelector('.VwiC3b, .st, span')?.textContent?.trim() ?? '',
+      }))
+    ).catch(() => [])
+
+    const found = []
+    for (const r of results) {
+      if (!r.url.includes('linkedin.com/in/')) continue
+
+      // Formato típico do LinkedIn no Google: "Nome Sobrenome - Cargo - Empresa | LinkedIn"
+      const parts = r.title.replace(' | LinkedIn', '').split(' - ').map(s => s.trim())
+      const name  = parts[0]
+      const role  = parts[1] ?? null
+
+      if (!name || name.length < 3) continue
+
+      // Garante que é alguém da empresa (não apenas menção)
+      const isRelated = r.title.toLowerCase().includes(lead.companyName.toLowerCase().split(' ')[0])
+                     || r.snippet.toLowerCase().includes(lead.companyName.toLowerCase().split(' ')[0])
+
+      if (!isRelated) continue
+
+      const already = lead.decisionMakers.find(dm =>
+        dm.name.toLowerCase() === name.toLowerCase()
+      )
+      if (!already) {
+        found.push({ name, role, linkedinUrl: r.url.split('?')[0], email: null, phonePersonal: lead.companyPhone ?? null })
+      }
+    }
+
+    if (found.length > 0) {
+      console.log(`   💼 LinkedIn (Google): ${found.length} decisor(es) encontrado(s)`)
+      lead.decisionMakers.push(...found.slice(0, 2))
+    }
+
+    return found.length > 0
+  } catch (err) {
+    console.warn(`   💼 LinkedIn busca: ${err.message}`)
+    return false
+  } finally {
+    await page.close()
+  }
+}
+
 // ── Google Maps via Playwright + Crawlee (stealth) ───────
 async function scrapeGoogleMaps(browser) {
   for (const query of searchQueries) {
@@ -430,22 +490,32 @@ try {
   // Enriquecimento: todos os leads passam pelo processo
   console.log(`\n🔍 Enriquecendo ${allLeads.length} lead(s)...`)
   for (const lead of allLeads) {
-    // 1. Extrai emails e CNPJ do site (se tiver)
+    console.log(`\n  → ${lead.companyName}`)
+
+    // 1. Extrai emails, telefones e CNPJ do site (se tiver)
     let cnpj = lead.website ? await enrichFromWebsite(browser, lead) : null
 
     // 2. Se não achou CNPJ no site, busca no Google pelo nome da empresa
-    if (!cnpj && lead.companyName) {
-      cnpj = await findCnpjByName(browser, lead.companyName)
-    }
+    if (!cnpj) cnpj = await findCnpjByName(browser, lead.companyName)
 
-    // 3. Busca sócios/administradores via CNPJ
+    // 3. Busca sócios/administradores e telefone via CNPJ (Receita Federal)
     if (cnpj) await enrichFromCnpj(lead, cnpj)
 
-    if (lead.decisionMakers.length > 0) {
-      console.log(`   ✅ ${lead.companyName}: ${lead.decisionMakers.length} decisor(es) encontrado(s)`)
-    } else {
-      console.log(`   ⚠️  ${lead.companyName}: sem decisores encontrados`)
+    // 4. Se ainda não tem decisores, busca no LinkedIn via Google (sem cookie)
+    if (lead.decisionMakers.length === 0) {
+      await findLinkedInDecisionMaker(browser, lead)
     }
+
+    // 5. Garante que o decisor principal tem o telefone da empresa como fallback
+    if (lead.decisionMakers.length > 0 && lead.companyPhone) {
+      const dm = lead.decisionMakers[0]
+      if (!dm.phonePersonal) dm.phonePersonal = lead.companyPhone
+    }
+
+    const status = lead.decisionMakers.length > 0
+      ? `✅ ${lead.decisionMakers.length} decisor(es): ${lead.decisionMakers.map(d => d.name).join(', ')}`
+      : `⚠️  sem decisores — será adicionado como lead sem contato específico`
+    console.log(`     ${status}`)
   }
 } finally {
   await browser.close()

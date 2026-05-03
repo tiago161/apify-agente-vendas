@@ -168,7 +168,7 @@ async function scrapeGoogleMaps() {
           {
             searchTermsOrUrl:          [`${query} ${location}`],
             maxCrawledPlacesPerSearch: maxResultsPerQuery,
-            language:                  'pt',
+            language:                  'pt-BR',
             countryCode:               'br',
             includeWebResults:         false,
           },

@@ -149,63 +149,81 @@ async function enrichFromCnpj(lead, cnpj) {
   }
 }
 
-// ── Google Maps via Apify Actor (anti-bot resistente) ────
-// Usa o compass/crawler-google-places que contorna as proteções do Google
-async function scrapeGoogleMaps() {
-  const token = Actor.getEnv().token
-  if (!token) {
-    console.error('❌ Token Apify não disponível para chamar ator de Google Maps')
-    return
-  }
-
+// ── Google Maps via Playwright + Crawlee (stealth) ───────
+async function scrapeGoogleMaps(browser) {
   for (const query of searchQueries) {
     for (const location of locations) {
       console.log(`\n🗺️  Google Maps: "${query}" em "${location}"`)
+
+      const context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        viewport:  { width: 1280, height: 800 },
+        locale:    'pt-BR',
+        timezoneId: 'America/Sao_Paulo',
+      })
+      const page = await context.newPage()
+
+      // Remove sinais de automação
+      await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false })
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] })
+      })
+
       try {
-        // Chama o ator especializado que lida com anti-bot do Google
-        const { data: items } = await axios.post(
-          `https://api.apify.com/v2/acts/compass~crawler-google-places/run-sync-get-dataset-items?token=${token}&timeout=120`,
-          {
-            searchTermsOrUrl:          [`${query} ${location}`],
-            maxCrawledPlacesPerSearch: maxResultsPerQuery,
-            language:                  'pt-BR',
-          },
-          { timeout: 130_000 }
-        )
+        const url = `https://www.google.com/maps/search/${encodeURIComponent(`${query} ${location}`)}`
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40_000 })
 
-        console.log(`   Encontrados ${items.length} resultado(s)`)
+        // Aceita cookies/consent se aparecer
+        await page.click('button[aria-label*="Accept"], button[aria-label*="Aceitar"], form[action*="consent"] button', { timeout: 4_000 }).catch(() => null)
+        await page.waitForTimeout(2500)
 
-        for (const item of items) {
-          const name = item.title ?? item.name
-          if (!name) continue
-          addLead({
-            companyName:    name,
-            companyPhone:   item.phone ?? null,
-            website:        item.website ?? null,
-            category:       item.categoryName ?? item.categories?.[0] ?? null,
-            address:        item.address ?? null,
-            location,
-            source:         'google_maps',
-            decisionMakers: [],
-          })
-          console.log(`   ✓ ${name}`)
+        // Aguarda o feed de resultados
+        await page.waitForSelector('[role="feed"]', { timeout: 25_000 }).catch(() => null)
+        await page.waitForTimeout(1500)
+
+        // Rola para carregar mais
+        for (let i = 0; i < Math.ceil(maxResultsPerQuery / 5); i++) {
+          await page.evaluate(() => document.querySelector('[role="feed"]')?.scrollBy(0, 1200))
+          await page.waitForTimeout(800)
+        }
+
+        // Tenta múltiplos seletores de card
+        let cards = []
+        for (const sel of ['.Nv2PK', '[role="article"]', '.hfpxzc']) {
+          cards = await page.$$(sel)
+          if (cards.length > 0) break
+        }
+        cards = cards.slice(0, maxResultsPerQuery)
+        console.log(`   Encontrados ${cards.length} resultado(s)`)
+
+        for (const card of cards) {
+          try {
+            // Nome extraído diretamente do card (evita h1 "Results")
+            const name = await card.$eval('.qBF1Pd',        el => el.textContent?.trim()).catch(() => null)
+                      ?? await card.$eval('.fontHeadlineSmall', el => el.textContent?.trim()).catch(() => null)
+                      ?? await card.$eval('[aria-label]',    el => el.getAttribute('aria-label')).catch(() => null)
+
+            if (!name || name === 'Results') continue
+
+            await card.click()
+            await page.waitForTimeout(1200)
+
+            const phone   = await page.$eval('[data-item-id^="phone:"]', el => el.getAttribute('data-item-id')?.replace('phone:', '') ?? null).catch(() => null)
+            const website = await safeAttr(page, 'a[data-item-id="authority"]', 'href')
+            const address = await safeText(page, '[data-item-id="address"]')
+            const cat     = await safeText(page, 'button[jsaction*="category"]')
+
+            addLead({ companyName: name, companyPhone: phone?.trim() ?? null, website: website ?? null, category: cat ?? null, address: address ?? null, location, source: 'google_maps', decisionMakers: [] })
+            console.log(`   ✓ ${name}`)
+          } catch (err) {
+            console.warn('   Aviso card:', err.message)
+          }
         }
       } catch (err) {
-        const status  = err?.response?.status
-        const detail  = err?.response?.data?.error?.message
-                     ?? err?.response?.data?.message
-                     ?? err?.response?.data
-                     ?? err.message
-        if (status === 402) {
-          console.error('   ❌ Plano Apify insuficiente. O ator compass/crawler-google-places pode exigir créditos.')
-          console.error('   → Verifique em: apify.com/store/compass/crawler-google-places')
-        } else if (status === 400) {
-          console.error(`   ❌ Input inválido: ${JSON.stringify(detail)}`)
-        } else if (status === 404) {
-          console.error('   ❌ Ator não encontrado. Verifique o ID: compass~crawler-google-places')
-        } else {
-          console.error(`   ❌ Erro Google Maps (${status ?? 'sem status'}): ${JSON.stringify(detail)}`)
-        }
+        console.error(`   Erro Google Maps: ${err.message}`)
+      } finally {
+        await page.close()
+        await context.close()
       }
     }
   }
@@ -322,29 +340,22 @@ console.log(`   Fontes: ${sources.join(', ')}`)
 console.log(`   Filtros: ${excludeKeywords.length ? excludeKeywords.join(', ') : 'nenhum'}`)
 console.log(`   Máx/busca: ${maxResultsPerQuery}\n`)
 
-// Google Maps não precisa de browser (usa API do Apify)
-if (sources.includes('google_maps')) await scrapeGoogleMaps()
+const browser = await chromium.launch({ headless: true })
+try {
+  if (sources.includes('google_maps')) await scrapeGoogleMaps(browser)
+  if (sources.includes('linkedin'))    await scrapeLinkedIn(browser)
+  if (sources.includes('instagram'))   await scrapeInstagram(browser)
 
-// LinkedIn e Instagram precisam de browser
-const needsBrowser = sources.includes('linkedin') || sources.includes('instagram')
-const leadsWithSite = allLeads.filter(l => l.website)
-
-if (needsBrowser || leadsWithSite.length > 0) {
-  const browser = await chromium.launch({ headless: true })
-  try {
-    if (sources.includes('linkedin'))  await scrapeLinkedIn(browser)
-    if (sources.includes('instagram')) await scrapeInstagram(browser)
-
-    if (leadsWithSite.length > 0) {
-      console.log(`\n🔍 Enriquecendo ${leadsWithSite.length} lead(s) com dados do site e CNPJ...`)
-      for (const lead of leadsWithSite) {
-        const cnpj = await enrichFromWebsite(browser, lead)
-        await enrichFromCnpj(lead, cnpj ?? lead.cnpj ?? null)
-      }
+  const leadsWithSite = allLeads.filter(l => l.website)
+  if (leadsWithSite.length > 0) {
+    console.log(`\n🔍 Enriquecendo ${leadsWithSite.length} lead(s) com dados do site e CNPJ...`)
+    for (const lead of leadsWithSite) {
+      const cnpj = await enrichFromWebsite(browser, lead)
+      await enrichFromCnpj(lead, cnpj ?? lead.cnpj ?? null)
     }
-  } finally {
-    await browser.close()
   }
+} finally {
+  await browser.close()
 }
 
 console.log(`\n📊 Total de leads coletados: ${allLeads.length}`)

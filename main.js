@@ -169,8 +169,6 @@ async function scrapeGoogleMaps() {
             searchTermsOrUrl:          [`${query} ${location}`],
             maxCrawledPlacesPerSearch: maxResultsPerQuery,
             language:                  'pt-BR',
-            countryCode:               'br',
-            includeWebResults:         false,
           },
           { timeout: 130_000 }
         )
@@ -193,12 +191,20 @@ async function scrapeGoogleMaps() {
           console.log(`   ✓ ${name}`)
         }
       } catch (err) {
-        const status = err?.response?.status
+        const status  = err?.response?.status
+        const detail  = err?.response?.data?.error?.message
+                     ?? err?.response?.data?.message
+                     ?? err?.response?.data
+                     ?? err.message
         if (status === 402) {
-          console.error('   ❌ Plano Apify insuficiente para usar compass/crawler-google-places.')
-          console.error('   → Acesse apify.com/store/compass/crawler-google-places e verifique os requisitos.')
+          console.error('   ❌ Plano Apify insuficiente. O ator compass/crawler-google-places pode exigir créditos.')
+          console.error('   → Verifique em: apify.com/store/compass/crawler-google-places')
+        } else if (status === 400) {
+          console.error(`   ❌ Input inválido: ${JSON.stringify(detail)}`)
+        } else if (status === 404) {
+          console.error('   ❌ Ator não encontrado. Verifique o ID: compass~crawler-google-places')
         } else {
-          console.error(`   ❌ Erro Google Maps: ${err?.response?.data?.error?.message ?? err.message}`)
+          console.error(`   ❌ Erro Google Maps (${status ?? 'sem status'}): ${JSON.stringify(detail)}`)
         }
       }
     }

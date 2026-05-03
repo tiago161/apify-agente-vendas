@@ -16,6 +16,14 @@ const {
 } = input ?? {}
 
 const allLeads = []
+const seenCompanies = new Set()
+
+function addLead(lead) {
+  const key = lead.companyName.trim().toLowerCase()
+  if (seenCompanies.has(key)) return
+  seenCompanies.add(key)
+  allLeads.push(lead)
+}
 
 async function sendToCrm(leads) {
   if (!webhookUrl || leads.length === 0) return
@@ -96,7 +104,7 @@ async function scrapeGoogleMaps(browser) {
             const category = await safeText(page, 'button[jsaction*="category"]')
             const address  = await safeText(page, '[data-item-id="address"]')
 
-            allLeads.push({
+            addLead({
               companyName:    name,
               companyPhone:   phone?.trim() ?? null,
               website:        website ?? null,
@@ -156,7 +164,7 @@ async function scrapeLinkedIn(browser) {
             const linkedinUrl = await card.$eval('.entity-result__title-text a',       el => el.getAttribute('href')).catch(() => null)
 
             if (name) {
-              allLeads.push({
+              addLead({
                 companyName:    company ?? query,
                 companyPhone:   null,
                 source:         'linkedin',
@@ -216,7 +224,7 @@ async function scrapeInstagram(browser) {
           const emailMatch = bio?.match(/[\w.-]+@[\w.-]+\.\w+/)
 
           if (name) {
-            allLeads.push({
+            addLead({
               companyName:    name,
               companyPhone:   phoneMatch?.[1]?.trim() ?? null,
               source:         'instagram',

@@ -56,13 +56,22 @@ async function safeAttr(page, selector, attr) {
   return page.$eval(selector, (el, a) => el.getAttribute(a), attr).catch(() => null)
 }
 
-function extractEmails(pageOrHtml) {
-  // Extrai de texto puro E de atributos mailto:
-  const html   = typeof pageOrHtml === 'string' ? pageOrHtml : ''
+function extractEmails(html) {
   const fromText = html.match(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi) ?? []
   const fromHref = [...(html.matchAll(/href=["']mailto:([\w.+-]+@[\w.-]+\.[a-z]{2,})/gi))].map(m => m[1])
   return [...new Set([...fromText, ...fromHref])
-    .filter(e => !/noreply|no-reply|example|seudominio|@2x|\.png|\.jpg|suporte@|atendimento@|contato@|info@/i.test(e))]
+    .filter(e => !/noreply|no-reply|example|seudominio|@2x|\.png|\.jpg|suporte@|atendimento@/i.test(e))]
+}
+
+function extractPhones(html) {
+  // Links tel: e wa.me + números no formato brasileiro
+  const fromTel   = [...(html.matchAll(/href=["']tel:([\d\s\+\-\(\)]{8,})/gi))].map(m => m[1].replace(/\D/g, ''))
+  const fromWa    = [...(html.matchAll(/wa\.me\/(\d{10,15})/gi))].map(m => m[1])
+  const fromText  = [...(html.matchAll(/(?:\+55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\s?)?\d{4}[\s\-]?\d{4}/g))].map(m => m[0].replace(/\D/g, ''))
+  const all = [...new Set([...fromTel, ...fromWa, ...fromText])]
+    .filter(n => n.length >= 10 && n.length <= 13)
+    .map(n => n.startsWith('55') ? `+${n}` : `+55${n.slice(-11)}`)
+  return [...new Set(all)]
 }
 
 function extractCnpj(html) {
@@ -101,16 +110,20 @@ async function enrichFromWebsite(browser, lead) {
     await page.goto(lead.website, { waitUntil: 'load', timeout: 15_000 })
     const html = await page.content()
 
-    // Emails no HTML + links mailto:
+    // Emails, telefones e CNPJ na home
     const homeEmails = extractEmails(html)
+    const homePhones = extractPhones(html)
 
-    // Emails em atributos href="mailto:..." via Playwright
+    // Emails via Playwright (href="mailto:")
     const mailtoEmails = await page.$$eval('a[href^="mailto:"]', els =>
-      els.map(el => el.getAttribute('href')?.replace('mailto:', '').split('?')[0])
-        .filter(Boolean)
+      els.map(el => el.getAttribute('href')?.replace('mailto:', '').split('?')[0]).filter(Boolean)
     ).catch(() => [])
 
-    // CNPJ na home
+    // Telefones via Playwright (href="tel:" e wa.me)
+    const telPhones = await page.$$eval('a[href^="tel:"], a[href*="wa.me"]', els =>
+      els.map(el => el.getAttribute('href')?.replace(/tel:|https?:\/\/wa\.me\//gi, '').split('?')[0]).filter(Boolean)
+    ).catch(() => [])
+
     let cnpj = extractCnpj(html)
 
     // Tenta páginas de contato/sobre
@@ -122,32 +135,52 @@ async function enrichFromWebsite(browser, lead) {
     ).catch(() => [])
 
     const extraEmails = []
+    const extraPhones = []
     for (const url of contactUrls) {
       const sub = await browser.newPage()
       try {
         await sub.goto(url, { waitUntil: 'load', timeout: 10_000 })
         const subHtml = await sub.content()
         extraEmails.push(...extractEmails(subHtml))
+        extraPhones.push(...extractPhones(subHtml))
         if (!cnpj) cnpj = extractCnpj(subHtml)
         extraEmails.push(...await sub.$$eval('a[href^="mailto:"]', els =>
           els.map(el => el.getAttribute('href')?.replace('mailto:', '').split('?')[0]).filter(Boolean)
         ).catch(() => []))
+        extraPhones.push(...await sub.$$eval('a[href^="tel:"], a[href*="wa.me"]', els =>
+          els.map(el => el.getAttribute('href')?.replace(/tel:|https?:\/\/wa\.me\//gi, '').split('?')[0]).filter(Boolean)
+        ).catch(() => []))
       } catch { /* ignora */ } finally { await sub.close() }
     }
 
-    const allEmails = [...new Set([...homeEmails, ...mailtoEmails, ...extraEmails])]
-      .filter(e => e && e.includes('@'))
+    const allEmails = [...new Set([...homeEmails, ...mailtoEmails, ...extraEmails])].filter(Boolean)
+    const allPhones = [...new Set([...homePhones, ...telPhones, ...extraPhones])].filter(Boolean)
+
+    // Usa telefone do site se o lead ainda não tem
+    if (allPhones.length > 0 && !lead.companyPhone) {
+      lead.companyPhone = allPhones[0]
+    }
 
     if (allEmails.length > 0 && lead.decisionMakers.length === 0) {
       lead.decisionMakers.push({
-        name: lead.companyName, email: allEmails[0], role: 'Contato do Site', phonePersonal: null,
+        name: lead.companyName, email: allEmails[0],
+        role: 'Contato do Site',
+        phonePersonal: allPhones[0] ?? null,
       })
-    } else if (allEmails.length > 0) {
-      lead.decisionMakers.forEach(dm => { if (!dm.email) dm.email = allEmails[0] })
+    } else if (lead.decisionMakers.length > 0) {
+      const dm = lead.decisionMakers[0]
+      if (!dm.email && allEmails.length > 0)         dm.email = allEmails[0]
+      if (!dm.phonePersonal && allPhones.length > 0) dm.phonePersonal = allPhones[0]
+    }
+
+    // Se o lead tem phone do Maps mas o decisor não tem nenhum, passa o da empresa
+    if (lead.companyPhone && lead.decisionMakers.length > 0) {
+      const dm = lead.decisionMakers[0]
+      if (!dm.phonePersonal) dm.phonePersonal = lead.companyPhone
     }
 
     if (cnpj) lead.cnpj = cnpj
-    console.log(`   🌐 Site: ${allEmails.length} email(s), CNPJ: ${cnpj ?? 'não encontrado no site'}`)
+    console.log(`   🌐 Site: ${allEmails.length} email(s), ${allPhones.length} tel(s), CNPJ: ${cnpj ?? 'não encontrado'}`)
     return cnpj
   } catch (err) {
     console.warn(`   🌐 Erro no site: ${err.message}`)
@@ -163,6 +196,13 @@ async function enrichFromCnpj(lead, cnpj) {
   try {
     const { data } = await axios.get(`https://brasilapi.com.br/api/cnpj/v1/${cnpj}`, { timeout: 12_000 })
     const socios = data.qsa ?? []
+
+    // Telefone do registro federal como fallback para a empresa
+    const cnpjPhone = data.ddd_telefone_1
+      ? `+55${data.ddd_telefone_1.replace(/\D/g, '')}`
+      : null
+    if (cnpjPhone && !lead.companyPhone) lead.companyPhone = cnpjPhone
+
     for (const socio of socios.slice(0, 3)) {
       if (!socio.nome_socio) continue
       const already = lead.decisionMakers.find(dm =>
@@ -173,11 +213,18 @@ async function enrichFromCnpj(lead, cnpj) {
           name:          socio.nome_socio,
           role:          socio.qualificacao_socio ?? 'Sócio/Administrador',
           email:         null,
-          phonePersonal: null,
+          // Passa o telefone da empresa para o sócio principal quando é o primeiro
+          phonePersonal: lead.decisionMakers.length === 0 ? (cnpjPhone ?? lead.companyPhone ?? null) : null,
         })
       }
     }
-    if (socios.length > 0) console.log(`   🏛️ CNPJ: ${socios.length} sócio(s) encontrado(s)`)
+
+    // Se o decisor ainda não tem telefone, usa o da empresa
+    if (lead.decisionMakers.length > 0 && !lead.decisionMakers[0].phonePersonal) {
+      lead.decisionMakers[0].phonePersonal = lead.companyPhone ?? null
+    }
+
+    if (socios.length > 0) console.log(`   🏛️ CNPJ: ${socios.length} sócio(s), tel: ${cnpjPhone ?? 'N/A'}`)
   } catch (err) {
     if (err?.response?.status !== 404) console.warn(`   🏛️ CNPJ ${cnpj}: ${err.message}`)
   }

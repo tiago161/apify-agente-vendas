@@ -56,16 +56,41 @@ async function safeAttr(page, selector, attr) {
   return page.$eval(selector, (el, a) => el.getAttribute(a), attr).catch(() => null)
 }
 
-function extractEmails(html) {
-  return [...new Set((html.match(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi) ?? [])
-    .filter(e => !/noreply|example|seudominio|@2x|\.png|\.jpg/i.test(e)))]
+function extractEmails(pageOrHtml) {
+  // Extrai de texto puro E de atributos mailto:
+  const html   = typeof pageOrHtml === 'string' ? pageOrHtml : ''
+  const fromText = html.match(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi) ?? []
+  const fromHref = [...(html.matchAll(/href=["']mailto:([\w.+-]+@[\w.-]+\.[a-z]{2,})/gi))].map(m => m[1])
+  return [...new Set([...fromText, ...fromHref])
+    .filter(e => !/noreply|no-reply|example|seudominio|@2x|\.png|\.jpg|suporte@|atendimento@|contato@|info@/i.test(e))]
 }
 
 function extractCnpj(html) {
-  const m = html.match(/\d{2}[.\-]?\d{3}[.\-]?\d{3}[\/\-]?\d{4}[.\-]?\d{2}/)
+  // Aceita formatos: 00.000.000/0000-00, 00000000000000, 00.000.000/000100
+  const m = html.match(/\d{2}[\.\s]?\d{3}[\.\s]?\d{3}[\s\/]?\d{4}[\-\s]?\d{2}(?!\d)/)
   if (!m) return null
   const digits = m[0].replace(/\D/g, '')
   return digits.length === 14 ? digits : null
+}
+
+// ── Busca CNPJ pelo nome da empresa no Google ─────────────
+async function findCnpjByName(browser, companyName) {
+  const page = await browser.newPage()
+  try {
+    const query = encodeURIComponent(`"${companyName}" CNPJ site:br OR site:brasilapi.com.br OR site:receitaws.com.br`)
+    await page.goto(`https://www.google.com/search?q=${query}`, {
+      waitUntil: 'domcontentloaded', timeout: 15_000,
+    })
+    await page.waitForTimeout(1000)
+    const html = await page.content()
+    const cnpj = extractCnpj(html)
+    if (cnpj) console.log(`   🔎 CNPJ encontrado via Google: ${cnpj}`)
+    return cnpj
+  } catch {
+    return null
+  } finally {
+    await page.close()
+  }
 }
 
 // ── Enriquece via site da empresa ─────────────────────────
@@ -76,14 +101,22 @@ async function enrichFromWebsite(browser, lead) {
     await page.goto(lead.website, { waitUntil: 'load', timeout: 15_000 })
     const html = await page.content()
 
-    // Emails e CNPJ na home
+    // Emails no HTML + links mailto:
     const homeEmails = extractEmails(html)
-    const cnpj = extractCnpj(html)
 
-    // Tenta páginas de contato/sobre/equipe
+    // Emails em atributos href="mailto:..." via Playwright
+    const mailtoEmails = await page.$$eval('a[href^="mailto:"]', els =>
+      els.map(el => el.getAttribute('href')?.replace('mailto:', '').split('?')[0])
+        .filter(Boolean)
+    ).catch(() => [])
+
+    // CNPJ na home
+    let cnpj = extractCnpj(html)
+
+    // Tenta páginas de contato/sobre
     const contactUrls = await page.$$eval('a[href]', (els, base) =>
       els.map(el => el.href)
-        .filter(h => h.startsWith(base) && /contato|fale|contact|sobre|equipe|time|about/i.test(h))
+        .filter(h => h.startsWith(base) && /contato|fale|contact|sobre|equipe|time|about|quem.somos/i.test(h))
         .slice(0, 3),
       new URL(lead.website).origin
     ).catch(() => [])
@@ -93,30 +126,31 @@ async function enrichFromWebsite(browser, lead) {
       const sub = await browser.newPage()
       try {
         await sub.goto(url, { waitUntil: 'load', timeout: 10_000 })
-        extraEmails.push(...extractEmails(await sub.content()))
+        const subHtml = await sub.content()
+        extraEmails.push(...extractEmails(subHtml))
+        if (!cnpj) cnpj = extractCnpj(subHtml)
+        extraEmails.push(...await sub.$$eval('a[href^="mailto:"]', els =>
+          els.map(el => el.getAttribute('href')?.replace('mailto:', '').split('?')[0]).filter(Boolean)
+        ).catch(() => []))
       } catch { /* ignora */ } finally { await sub.close() }
     }
 
-    const allEmails = [...new Set([...homeEmails, ...extraEmails])]
+    const allEmails = [...new Set([...homeEmails, ...mailtoEmails, ...extraEmails])]
+      .filter(e => e && e.includes('@'))
 
-    // Se não tem decisor ainda, cria um com o e-mail encontrado
     if (allEmails.length > 0 && lead.decisionMakers.length === 0) {
       lead.decisionMakers.push({
-        name:          'Contato ' + lead.companyName,
-        email:         allEmails[0],
-        role:          'Contato do Site',
-        phonePersonal: null,
+        name: lead.companyName, email: allEmails[0], role: 'Contato do Site', phonePersonal: null,
       })
     } else if (allEmails.length > 0) {
-      // Completa e-mail de decisor existente se estiver vazio
       lead.decisionMakers.forEach(dm => { if (!dm.email) dm.email = allEmails[0] })
     }
 
     if (cnpj) lead.cnpj = cnpj
-    console.log(`   🌐 Site: ${allEmails.length} email(s), CNPJ: ${cnpj ?? 'não encontrado'}`)
+    console.log(`   🌐 Site: ${allEmails.length} email(s), CNPJ: ${cnpj ?? 'não encontrado no site'}`)
     return cnpj
   } catch (err) {
-    console.warn(`   🌐 Erro no site ${lead.website}: ${err.message}`)
+    console.warn(`   🌐 Erro no site: ${err.message}`)
     return null
   } finally {
     await page.close()
@@ -346,12 +380,24 @@ try {
   if (sources.includes('linkedin'))    await scrapeLinkedIn(browser)
   if (sources.includes('instagram'))   await scrapeInstagram(browser)
 
-  const leadsWithSite = allLeads.filter(l => l.website)
-  if (leadsWithSite.length > 0) {
-    console.log(`\n🔍 Enriquecendo ${leadsWithSite.length} lead(s) com dados do site e CNPJ...`)
-    for (const lead of leadsWithSite) {
-      const cnpj = await enrichFromWebsite(browser, lead)
-      await enrichFromCnpj(lead, cnpj ?? lead.cnpj ?? null)
+  // Enriquecimento: todos os leads passam pelo processo
+  console.log(`\n🔍 Enriquecendo ${allLeads.length} lead(s)...`)
+  for (const lead of allLeads) {
+    // 1. Extrai emails e CNPJ do site (se tiver)
+    let cnpj = lead.website ? await enrichFromWebsite(browser, lead) : null
+
+    // 2. Se não achou CNPJ no site, busca no Google pelo nome da empresa
+    if (!cnpj && lead.companyName) {
+      cnpj = await findCnpjByName(browser, lead.companyName)
+    }
+
+    // 3. Busca sócios/administradores via CNPJ
+    if (cnpj) await enrichFromCnpj(lead, cnpj)
+
+    if (lead.decisionMakers.length > 0) {
+      console.log(`   ✅ ${lead.companyName}: ${lead.decisionMakers.length} decisor(es) encontrado(s)`)
+    } else {
+      console.log(`   ⚠️  ${lead.companyName}: sem decisores encontrados`)
     }
   }
 } finally {
